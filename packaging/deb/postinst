@@ -1,0 +1,29 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = "configure" ]; then
+    if ! id ridgewarden-library >/dev/null 2>&1; then
+        adduser --system --group --home /var/lib/ridgewarden-library --no-create-home ridgewarden-library
+    fi
+    adduser ridgewarden-library ridgewarden >/dev/null
+    install -d -m 750 -o ridgewarden-library -g ridgewarden-library /var/lib/ridgewarden-library
+    # an upgrade from when apps ran as the core's user leaves files it owned
+    chown -R ridgewarden-library:ridgewarden-library /var/lib/ridgewarden-library
+    install -d -m 2770 -o ridgewarden -g ridgewarden /var/lib/ridgewarden/imports /var/lib/ridgewarden/exports
+    if [ ! -f /etc/ridgewarden/library.toml ]; then
+        /usr/bin/ridgewarden-library --config /etc/ridgewarden/library.toml init
+        # it holds the NWS contact address
+    fi
+    # its webhook URLs and passphrases are for this app only, not the other apps
+    # in the ridgewarden group
+    chown root:ridgewarden-library /etc/ridgewarden/library.toml
+    chmod 640 /etc/ridgewarden/library.toml
+    if [ -d /run/systemd/system ]; then
+        systemctl daemon-reload
+        # start once the core is set up; until then there's nothing to follow
+        if [ -f /etc/ridgewarden/ridgewarden.toml ]; then
+            systemctl enable ridgewarden-library >/dev/null 2>&1 || true
+            systemctl restart ridgewarden-library || true
+        fi
+    fi
+fi

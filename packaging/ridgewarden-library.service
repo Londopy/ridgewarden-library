@@ -1,0 +1,23 @@
+[Unit]
+Description=ridgewarden-library, an offline library for AREDN meshes
+Documentation=https://github.com/Londopy/ridgewarden-library
+After=network-online.target ridgewarden.service
+Wants=network-online.target
+
+[Service]
+# its own user, in the core's group: it can read the core's local.token, not its station key
+User=ridgewarden-library
+Group=ridgewarden-library
+SupplementaryGroups=ridgewarden
+ExecStart=/usr/bin/ridgewarden-library --config /etc/ridgewarden/library.toml run
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# the core's import and export folders: files go in for publishing and come out when mirrored
+ReadWritePaths=/var/lib/ridgewarden-library /var/lib/ridgewarden/imports /var/lib/ridgewarden/exports
+
+[Install]
+WantedBy=multi-user.target
