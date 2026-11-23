@@ -115,13 +115,14 @@ jobs:
 
           name=ridgewarden-library-v$ver-${{ matrix.arch }}-linux
           mkdir -p "$name"
-          cp "$bin" packaging/ridgewarden-library.service README.md LICENSE "$name/"
+          cp "$bin" packaging/ridgewarden-library.service README.md LICENSE THIRD_PARTY.md "$name/"
           tar -czf "dist/$name.tar.gz" "$name"
 
           root=deb/ridgewarden-library_${ver}_${{ matrix.deb }}
           install -D -m 755 "$bin" "$root/usr/bin/ridgewarden-library"
           install -D -m 644 packaging/ridgewarden-library.service "$root/lib/systemd/system/ridgewarden-library.service"
           install -D -m 644 LICENSE "$root/usr/share/doc/ridgewarden-library/copyright"
+          install -D -m 644 THIRD_PARTY.md "$root/usr/share/doc/ridgewarden-library/THIRD_PARTY.md"
           install -D -m 755 packaging/deb/postinst "$root/DEBIAN/postinst"
           install -D -m 755 packaging/deb/prerm "$root/DEBIAN/prerm"
           cat > "$root/DEBIAN/control" <<EOF

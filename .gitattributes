@@ -18,3 +18,6 @@
 *.msi binary
 *.exe binary
 *.londopy binary
+
+# third-party map viewer files, kept byte for byte as published (THIRD_PARTY.md has their hashes)
+assets/viewer/** -text
