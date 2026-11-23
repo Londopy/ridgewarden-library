@@ -19,6 +19,7 @@ It needs a [ridgewarden](https://github.com/Londopy/ridgewarden) core running on
 - The old copy keeps serving until the new one has fully arrived and passed its checks. If kiwix-serve won't start on a new ZIM file, it goes back to the files that worked, and those are kept until a new set has stayed up for a minute.
 - Wikipedia (and any other Kiwix ZIM file) served by kiwix-serve, which this app can start, restart and check on.
 - PMTiles map files served over HTTP with Range requests, so any PMTiles reader fetches only the tiles it shows. Each map has an address that always serves its newest version.
+- A map viewer in the browser that needs no internet: MapLibre GL JS, the Protomaps basemap style, fonts and icons all come from the site itself.
 - Documents (forms, plans, phone lists) in PDF, text, CSV, Markdown, office and image formats, copied like everything else and listed on their own page.
 - Tiers: small sites hold Wikipedia mini, hubs hold Wikipedia without pictures, from one config line per item.
 - Topology-aware fan-out along the best-connected tree: a site waits while a library site on its best path to a copy is still fetching, then has its core fetch from the best-connected sites that hold the version first, so a version usually crosses each radio hop once.
@@ -28,7 +29,7 @@ It needs a [ridgewarden](https://github.com/Londopy/ridgewarden) core running on
 - Alert delivery time measured at every site against the one-minute goal.
 - New versions handed to the data-mule app (ridgewarden-mule) for other islands, with each trip shown on the catalog.
 - Disk limits: per item, in total, and a free-space floor checked before each copy.
-- Attribution pages for Wikipedia (CC BY-SA) and OpenStreetMap (ODbL).
+- Each item's license and credit, as the fetcher's operator states them, shown with it on the catalog, Wikipedia, Maps, Documents and viewer pages and listed together on the About page. Wikipedia from Kiwix (CC BY-SA 4.0) and maps cut from a Protomaps build (OpenStreetMap, ODbL) get theirs filled in.
 - `/api/catalog` and `/api/alerts` return the same data as JSON.
 
 ## Install
@@ -41,7 +42,7 @@ curl -fsSL https://github.com/Londopy/ridgewarden-library/releases/latest/downlo
 
 Or take the `.deb` from the [releases page](https://github.com/Londopy/ridgewarden-library/releases/latest): `sudo apt install ./ridgewarden-library_<version>_arm64.deb` (`_amd64` on a PC). Either way the download is checked against the release key your core already trusts, `/etc/ridgewarden/library.toml` is written if missing, and the service starts once the core is set up. The pages are on port 8795.
 
-The app runs as the core's user and writes into the core's import folder (`/var/lib/ridgewarden/imports`) and takes files from its export folder (`/var/lib/ridgewarden/exports`). If your core's `data_dir` is somewhere else, change `core.imports_dir` and the `ReadWritePaths` line of the systemd unit.
+The app writes into the core's import folder (`/var/lib/ridgewarden/imports`) and takes files from its export folder (`/var/lib/ridgewarden/exports`). If your core's `data_dir` is somewhere else, change `core.imports_dir` and the `ReadWritePaths` line of the systemd unit.
 
 Every release also has each download as a `.torrent`, with its GitHub download as the web seed, and signed `SHA256SUMS.txt` checksums.
 
@@ -78,6 +79,7 @@ sha256_url = "https://download.kiwix.org/zim/wikipedia/{name}.sha256"
 max_mb = 15000
 check_days = 30
 group = "wikipedia-en"
+# license, license_url and attribution are filled in for Wikipedia files from Kiwix
 
 [[item]]
 id = "wikipedia-en-nopic"
@@ -93,6 +95,20 @@ group = "wikipedia-en"              # and they hold it instead of mini
 Try it first with the one-article test file in the example config (`wikipedia_en_ray-charles_mini.zim`, under 1 MB). English Wikipedia mini is about 13 GB, without pictures about 49 GB. Downloads go over https with connect and stall timeouts, from wherever the redirects end, and resume with a Range request if they are interrupted. A failed fetch is tried again after 15 minutes, then 30, and so on up to once a day.
 
 The version shown is the date in Kiwix's file name (`..._2026-08.zim` is "2026-08"), or the file's Last-Modified date.
+
+### Licenses and credits
+
+Every item can say what license it is under and whom to credit. The fetcher signs them into each version's `library.item` event, and every site shows them next to the item and on its About page:
+
+```toml
+license = "CC BY-SA 4.0"
+license_url = "https://creativecommons.org/licenses/by-sa/4.0/"   # optional, http(s) only
+attribution = "Wikipedia contributors, packaged by Kiwix"
+```
+
+When an item sets none of them, two sources whose terms are certain get theirs filled in: Wikipedia files from download.kiwix.org (CC BY-SA 4.0, Wikipedia contributors) and maps cut from a Protomaps daily build with `{build}` (ODbL 1.0, OpenStreetMap contributors). For anything else, set them yourself; an item published without a license says "License not stated" wherever it is shown, and the fetcher logs a warning. The app doesn't read licenses out of the files: ZIM metadata sits in compressed clusters it can't open, and an item's license is the operator's to state.
+
+Change them later and the fetcher publishes the version it already serves again with the new license and credit: same file and blob, so nothing is downloaded or copied again, and no mule message goes out. Versions published by 0.1.0 carried no license at all. After the upgrade, each fetcher restates its current versions once; until then, and for versions from a fetcher still on 0.1.0, pages say "License not recorded (published before 0.2.0)".
 
 ### A regional map on a fetcher
 
@@ -120,6 +136,9 @@ kind = "pmtiles"
 title = "Regional map"
 file = "/var/lib/ridgewarden-library/region.pmtiles"
 max_mb = 2000
+license = "ODbL 1.0"
+license_url = "https://www.openstreetmap.org/copyright"
+attribution = "OpenStreetMap contributors"
 ```
 
 An operator's file is published once it has looked the same for two rounds in a row and hasn't been touched for two minutes, so a file still being copied in is never sent out half-written. It is published again whenever it changes.
@@ -135,6 +154,8 @@ kind = "doc"
 title = "Shelter phone list"
 file = "/var/lib/ridgewarden-library/docs/shelter-phones.csv"   # or url = "https://..."
 max_mb = 5
+license = "For the served agencies' use"
+attribution = "County emergency services office"
 ```
 
 A document keeps its file type, which must be one of pdf, txt, csv, md, odt, ods, docx, xlsx, png or jpg; HTML is refused, since a page served from here could run script. Each file is checked for the type it claims. Documents are served from `/files/<id>.<type>` with `X-Content-Type-Options: nosniff` and a sandboxing Content-Security-Policy. Anyone on the mesh can read them; don't publish anything private.
@@ -197,6 +218,18 @@ Each new alert is logged once as a `library.alert` event on the main log. The Ge
 
 Each site measures how long alerts take to reach it (from the fetcher logging one to this site's app having it) and reports the slowest of the last week; the alerts page and the catalog show it against the one-minute goal.
 
+That goal is spec sheet 04's: an alert reaches every site within one minute of a fetcher seeing it. Two other times come before its clock starts. The fetcher checks the NWS every `poll_s` (60 s), and when the fetcher goes quiet, another site takes over only after `quiet_s` (15 minutes, at least two heartbeats), so an alert issued in that gap is that much later. `quiet_s` is how long a fetcher may be silent before it counts as gone, not a delivery target.
+
+Alerts move between sites on the cores' sync rounds: every `[sync] interval_s` (2 minutes by default) each core pulls from `[sync] fanout` of the site's peers (2 by default), picked at random each round, and an alert needs one round or more per hop. With the core's defaults that is usually a few minutes, and the figure shows "slow". To meet the minute, shorten the rounds on the cores at library sites, in `ridgewarden.toml`:
+
+```toml
+[sync]
+interval_s = 20
+fanout = 4        # as many as a site's peers, so every round asks each of them
+```
+
+Each round fetches each chosen peer's list of chain heads: about 230 bytes per chain and two chains per station, so about 6 KB of payload a peer on a 13-site mesh, and about 70 KB a minute per site at fanout 4, nearly all of it when nothing has changed. The alerts page shows whether it is enough. A cheaper fix belongs in the core: a nudge that makes peers pull as soon as an urgent event is logged, instead of on the next round; the core doesn't have one yet.
+
 ### Wikipedia through kiwix-serve
 
 Reading ZIM files needs zstd and xz decompression, which this app doesn't carry, so Wikipedia is served by [kiwix-serve](https://kiwix.org/) (in Debian and Raspberry Pi OS as `kiwix-tools`). Either let the app run it on the current files, or run it yourself and give its address:
@@ -215,6 +248,16 @@ kiwix-serve runs as the app's own user. To run it as a separate user instead, gi
 
 Map files are at `http://<pi>:8795/files/<id>.pmtiles` (always the newest version) and under their versioned names; the Maps page lists both. A Range request gets at most 4 MiB per response; files up to 32 MiB can be fetched whole, and whole downloads of bigger files are refused to keep big transfers off the radio links. All responses together hold at most 48 MiB of file data in memory; a request that can't get its share within 20 seconds gets a 503. Any PMTiles reader that works over HTTP reads them, for example `pmtiles show http://<pi>:8795/files/<id>.pmtiles`.
 
+### The map viewer
+
+`http://<pi>:8795/viewer` shows a map this site holds (pick another with `?map=<id>`; the Maps page links each one), opened at the file's own bounds, with pan, zoom and the OpenStreetMap and Protomaps attribution on the map. It works at phone width. It needs a browser with JavaScript and WebGL 2 (any current phone or computer browser); without them the page says where the map file is instead. It is the only page that uses JavaScript, and every other page works without it.
+
+Everything it loads comes from this site, so it works with no internet: MapLibre GL JS 6.19.0, pmtiles 4.5.0, the Protomaps basemap layers 5.7.2 (the light style, English labels), the Noto Sans Regular, Medium and Italic glyphs for Latin, Latin Extended and punctuation, and the light icon sprites. They are the published files, unchanged, checked against the npm registry's integrity hashes and the upstream git hashes when they were added. [THIRD_PARTY.md](THIRD_PARTY.md) lists each file's source, version, license and SHA-256, and the packages bundled inside them with their licenses; the same text is at `/about/third-party`.
+
+They are built into the binary (about 2.6 MB of it) rather than installed beside it, so the viewer can't go missing or get out of step with the app, and a release stays one file. They are served under a path made from a hash of their contents and cached by browsers for good, so a phone downloads MapLibre (about 1.7 MB, sent uncompressed) over the mesh once, and again only after an update that changes the files.
+
+The style is made for the current Protomaps basemap schema (version 4, what `pmtiles extract` of a daily build gives). A version 3 file shows land and water but no roads, buildings or labels (seen with Protomaps' own Firenze demo file), and a file that isn't a Protomaps vector basemap at all gets a message saying so, with its address for another PMTiles reader. Names in scripts outside Latin are drawn with the device's own fonts, since only the Latin glyph ranges are included, so they look different and may show as boxes where the device has no font for them. The page asks the site only for the glyph files it holds, so nothing fails to load; MapLibre notes each character it draws this way as a console warning.
+
 ### Carrying updates to other islands
 
 With `[mule]` set on a fetcher, every new version is also sent as a `mule.msg` (bulk class, with the version's blob as its file) to each island in `to`, for [ridgewarden-mule](https://github.com/Londopy/ridgewarden-mule) cars to carry:
@@ -226,6 +269,14 @@ to = ["south"]
 ```
 
 The mule app plans each update like any bulk message and loads its file onto a car for that trip; don't add `"library/"` to a car core's `[blobs] auto_want` (it would fetch every version for every island, or fetch back what the car just let go). At the far island the `library.item` event and the blob arrive with the car, the library there copies it like any other version, and the mule app receipts it without keeping a second copy. The far library must trust the fetcher's core, the fetcher's core must be pinned to its island under the mule app's `[[islands]]` at the cars and the far sites, and big content needs a trip with that much room: English Wikipedia without pictures is about 49 GB. The catalog shows each trip's last record (picked up, handed over, delivered), and sites known only from `library.copied` records carried back by a car are listed as "(record)".
+
+## Part 97
+
+The library is a station server making reference material, maps and weather alerts available on the mesh for when the internet is down. Spec sheet 04 takes this from AREDN practice: a server may fetch weather and similar data and offer it on the mesh, but general browsing is out of scope. Everything crosses the radio links as plain HTTP, signed and never encrypted, and over RF it is the stations' cores copying content and alerts to each other.
+
+No music or video is the operators' rule to keep, not something the app enforces in full: documents can't be audio or video files, but the app doesn't look inside ZIM files, so don't list Kiwix files that carry video (TED talks, video channels).
+
+Every site holds its own copy so that people read the library at their own site, over its local network, not across the radio links. Someone without an amateur license reading another site's library across the mesh is generally treated as third-party communication under 47 CFR 97.115; see 97.115(b) on the control operator supervising a third party's participation, and (c) on third-party traffic through automatically controlled stations. It is up to the control operators of the stations involved; the app can't tell who is reading and doesn't try. To keep the pages to a site's own network, firewall port 8795 and kiwix-serve's port on the Pi to the local subnet. The About page says the same.
 
 ## What "verified" means
 
@@ -243,10 +294,10 @@ These parts of spec sheet 04 are not done, or are done differently:
 - A chunk a nearby site lacks can still come from a farther peer: the app asks its core for the nearest holders first rather than only, so a copy never stalls on one site being down.
 - Kiwix's per-piece hashes as the chunk manifest: the core's chunks are 1 MiB BLAKE3 pieces and Kiwix's are 4 MiB SHA-1 pieces, so they can't be one manifest; the whole-file SHA-256 is checked at both ends instead.
 - CAP XML per alert: not fetched, since the GeoJSON already carries the CAP fields.
-- A map viewer in the browser: it would need MapLibre GL, the pmtiles plugin, a style, fonts and sprites served locally; none is included.
+- Alerts within one minute at every site: met only with the cores' sync rounds shortened as above. The nudge that would meet it at the default rounds is a core change, not built.
 - Which sites can host an SSD, and what other content served agencies want, are questions for the people running the mesh, not software.
 
-Tested with small local files, a local HTTP server standing in for Kiwix and api.weather.gov, and two cores on the simulator; nothing has been downloaded from the real services by the tests.
+Not tested on real hardware: no Raspberry Pi, AREDN node or radio link has run it, and no real Kiwix, Protomaps or api.weather.gov download has gone through it. The tests use small local files and a local HTTP server standing in for Kiwix and api.weather.gov; mirroring, fan-out and alert delivery between sites have been shown only on two cores against the simulated mesh, and the map viewer only in desktop browsers on this machine.
 
 ## Building from source
 

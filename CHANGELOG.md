@@ -4,6 +4,17 @@ All notable changes to ridgewarden-library are listed here. The format follows [
 
 ## [Unreleased]
 
+### Added
+
+- A map viewer at `/viewer` that works with no internet: MapLibre GL JS 6.19.0, pmtiles 4.5.0, the Protomaps basemap style 5.7.2, Latin glyphs and the light sprites are built into the app and served from it, checked against their published hashes and listed with their licenses in THIRD_PARTY.md and at `/about/third-party`.
+- `license`, `license_url` and `attribution` on each `[[item]]`, signed into its `library.item` event and shown with the item on the catalog, Wikipedia, Maps, Documents and viewer pages and in `/api/catalog`. Wikipedia files from Kiwix and maps cut from a Protomaps build get theirs filled in.
+- A fetcher whose item's license or credit changes, or which published a version before items carried one, publishes the version it already serves again with the new credit: no download, no new copy, no mule message. Versions from 0.1.0 fetchers show "License not recorded (published before 0.2.0)".
+
+### Changed
+
+- The About page lists every item's license and credit instead of fixed Wikipedia and OpenStreetMap text, and says how 97.115 third-party rules apply to reading another site's library.
+- The alerts page says what its delivery figure depends on: the cores' sync rounds, the NWS poll interval and the failover time.
+
 ## [0.1.0] - 2026-11-20
 
 ### Added
