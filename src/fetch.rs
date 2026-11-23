@@ -13,9 +13,10 @@ use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 
 use crate::app::App;
+use crate::catalog::{self, Credit};
 use crate::config::ItemCfg;
 use crate::content::{blob_name, check_file, file_name, http_date_day, version_in_name};
-use crate::mirror::{Held, copy_file, install, move_file};
+use crate::mirror::{self, Held, copy_file, install, move_file};
 
 pub const BUILDS: &str = "https://build-metadata.protomaps.dev/builds.json";
 const DAY: i64 = 86_400_000;
@@ -78,13 +79,15 @@ struct Source {
     outbox: Option<String>,
     candidate: Option<String>,
     fails: i64,
+    /// the license and credit this site last published the item with
+    credit: Option<Credit>,
 }
 
 fn source(app: &App, item: &str) -> Result<Source> {
     Ok(app
         .db()
         .query_row(
-            "SELECT ident, checked_ms, outbox, candidate, fails FROM sources WHERE item = ?1",
+            "SELECT ident, checked_ms, outbox, candidate, fails, credit FROM sources WHERE item = ?1",
             [item],
             |r| {
                 Ok(Source {
@@ -93,6 +96,9 @@ fn source(app: &App, item: &str) -> Result<Source> {
                     outbox: r.get(2)?,
                     candidate: r.get(3)?,
                     fails: r.get(4)?,
+                    credit: r
+                        .get::<_, Option<String>>(5)?
+                        .and_then(|c| serde_json::from_str(&c).ok()),
                 })
             },
         )
@@ -128,6 +134,9 @@ pub async fn round(app: &App) -> Result<()> {
         {
             tracing::warn!("sending what {} published: {e:#}", it.id);
             continue;
+        }
+        if let Err(e) = restate(app, it, &src).await {
+            tracing::warn!("restating the license of {}: {e:#}", it.id);
         }
         if !due(it, src.checked_ms, src.fails, now_ms()) {
             continue;
@@ -639,6 +648,13 @@ async fn publish(app: &App, it: &ItemCfg, g: Got) -> Result<()> {
     if !g.keep {
         let _ = std::fs::remove_file(g.path.with_extension("ident"));
     }
+    let credit = it.credit();
+    if credit.license.is_empty() {
+        tracing::warn!(
+            "publishing {} with no license; set license and attribution in its [[item]]",
+            it.id
+        );
+    }
     let ev = json!({
         "item": it.id,
         "kind": it.kind.name(),
@@ -652,6 +668,9 @@ async fn publish(app: &App, it: &ItemCfg, g: Got) -> Result<()> {
         "hash_from": g.hash_from,
         "tiers": it.tiers,
         "group": it.group,
+        "license": credit.license,
+        "license_url": credit.license_url,
+        "attribution": credit.attribution,
         "fetched": ms_to_rfc3339(now),
     });
     let mut outbox = vec![json!(["library.item", ev])];
@@ -666,10 +685,10 @@ async fn publish(app: &App, it: &ItemCfg, g: Got) -> Result<()> {
     // saved before it is sent, so a core that is down right now gets it next round
     let outbox = Value::Array(outbox).to_string();
     app.db().execute(
-        "INSERT INTO sources (item, ident, checked_ms, outbox) VALUES (?1, ?2, ?3, ?4)
+        "INSERT INTO sources (item, ident, checked_ms, outbox, credit) VALUES (?1, ?2, ?3, ?4, ?5)
          ON CONFLICT(item) DO UPDATE SET ident = excluded.ident, outbox = excluded.outbox,
-             candidate = NULL",
-        params![it.id, g.ident, now, outbox],
+             candidate = NULL, credit = excluded.credit",
+        params![it.id, g.ident, now, outbox, serde_json::to_string(&credit)?],
     )?;
     install(
         app,
@@ -701,6 +720,62 @@ async fn publish(app: &App, it: &ItemCfg, g: Got) -> Result<()> {
 
 /// Log the events a publish left to send, dropping each from the outbox once the core has
 /// it, so a core that was down gets the rest next round and nothing is sent twice.
+/// Publish the version this site already published again, with the item's license and
+/// credit, when they changed since (or it was published before items carried one). Same
+/// file and blob, so nothing is downloaded or copied again, and no mule message goes out.
+async fn restate(app: &App, it: &ItemCfg, src: &Source) -> Result<()> {
+    let credit = it.credit();
+    if src.credit.as_ref() == Some(&credit) {
+        return Ok(());
+    }
+    let me = app.whoami().await?.key;
+    let outbox = {
+        let db = app.db();
+        // until this site's own event is back from the core, there is nothing to restate
+        let Some(old) = mirror::held_one(&db, &it.id)?
+            .map(|h| catalog::published_by(&db, &me, &it.id, &h.root))
+            .transpose()?
+            .flatten()
+        else {
+            return Ok(());
+        };
+        let outbox = (old.credit != credit).then(|| {
+            json!([["library.item", {
+                "item": old.item,
+                "kind": old.kind.name(),
+                "ext": old.ext,
+                "title": old.title,
+                "version": old.version,
+                "size": old.size,
+                "root": old.root,
+                "source": old.source,
+                "sha256": old.sha256,
+                "hash_from": old.hash_from,
+                "tiers": old.tiers,
+                "group": old.group,
+                "license": credit.license,
+                "license_url": credit.license_url,
+                "attribution": credit.attribution,
+                "fetched": ms_to_rfc3339(old.ts),
+            }]])
+            .to_string()
+        });
+        db.execute(
+            "INSERT INTO sources (item, outbox, credit) VALUES (?1, ?2, ?3)
+             ON CONFLICT(item) DO UPDATE SET outbox = excluded.outbox, credit = excluded.credit",
+            params![it.id, outbox, serde_json::to_string(&credit)?],
+        )?;
+        outbox
+    };
+    match outbox {
+        Some(o) => {
+            tracing::info!("restating the license of {} {}", it.id, credit.license);
+            flush(app, &it.id, &o).await
+        }
+        None => Ok(()),
+    }
+}
+
 async fn flush(app: &App, item: &str, outbox: &str) -> Result<()> {
     let mut left: Vec<Value> = serde_json::from_str(outbox)?;
     while let Some(e) = left.first() {

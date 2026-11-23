@@ -13,6 +13,7 @@ use ridgewarden_client::core::Projection;
 use ridgewarden_client::mesh::s;
 use ridgewarden_client::util::{norm_node, valid_node};
 use rusqlite::{Connection, Transaction, params};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::content::{DOC_EXTS, Kind, valid_item, valid_version};
@@ -42,7 +43,13 @@ CREATE TABLE IF NOT EXISTS items (
     sha256      TEXT,
     hash_from   TEXT,
     tiers       TEXT NOT NULL,
-    grp         TEXT NOT NULL
+    grp         TEXT NOT NULL,
+    -- NULL when the event carried no license at all (sent by a 0.1.0 fetcher)
+    license     TEXT,
+    license_url TEXT,
+    attribution TEXT NOT NULL DEFAULT '',
+    -- the author's seq of the event whose credit this row shows; a fetcher restates a changed one
+    credit_seq  INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS items_item_ts ON items(item, ts);
 CREATE INDEX IF NOT EXISTS items_item_root ON items(item, root);
@@ -119,6 +126,43 @@ pub fn cap(v: Option<&str>, n: usize) -> Option<String> {
     v.map(|x| x.chars().take(n).collect())
 }
 
+/// An http(s) address that is safe to put in a link.
+pub fn web_url(u: &str) -> bool {
+    u.len() <= 300
+        && reqwest::Url::parse(u)
+            .is_ok_and(|p| matches!(p.scheme(), "http" | "https") && p.host_str().is_some())
+}
+
+/// The license an item is under and who to credit, as its fetcher's operator stated them.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Credit {
+    /// e.g. "CC BY-SA 4.0"; empty when nobody said
+    pub license: String,
+    pub license_url: Option<String>,
+    /// e.g. "Wikipedia contributors, packaged by Kiwix"
+    pub attribution: String,
+    /// false for a version published before items carried a license at all
+    pub recorded: bool,
+}
+
+impl Credit {
+    fn parse(p: &Value) -> Credit {
+        let text = |k, n| {
+            cap(s(p, k), n)
+                .map(|t| t.trim().to_string())
+                .unwrap_or_default()
+        };
+        Credit {
+            license: text("license", 80),
+            license_url: s(p, "license_url")
+                .filter(|u| web_url(u))
+                .map(str::to_string),
+            attribution: text("attribution", 300),
+            recorded: p.get("license").is_some(),
+        }
+    }
+}
+
 /// A published version of an item.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Item {
@@ -141,6 +185,7 @@ pub struct Item {
     pub tiers: Vec<String>,
     /// items in a group are alternatives; a site holds one
     pub group: String,
+    pub credit: Credit,
 }
 
 fn strings(v: Option<&Value>, max: usize, len: usize) -> Vec<String> {
@@ -185,6 +230,7 @@ pub fn parse_item(p: &Value) -> Option<Item> {
         } else {
             String::new()
         },
+        credit: Credit::parse(p),
     })
     .map(|mut it| {
         it.hash_from = it.sha256.as_ref().and(cap(s(p, "hash_from"), 300));
@@ -249,10 +295,36 @@ impl Projection for Items {
         let Some(it) = parse_item(&e.payload) else {
             return Ok(());
         };
+        // the same fetcher restating a version it already published: only its credit changes
+        let restated = tx.execute(
+            "UPDATE items SET license = ?1, license_url = ?2, attribution = ?3, credit_seq = ?4
+             WHERE author_key = ?5 AND item = ?6 AND version = ?7 AND root = ?8 AND credit_seq < ?4",
+            params![
+                it.credit.recorded.then_some(&it.credit.license),
+                it.credit.license_url,
+                it.credit.attribution,
+                e.seq as i64,
+                e.author.key,
+                it.item,
+                it.version,
+                it.root
+            ],
+        )?;
+        let known: bool = tx.query_row(
+            "SELECT count(*) > 0 FROM items
+             WHERE author_key = ?1 AND item = ?2 AND version = ?3 AND root = ?4",
+            params![e.author.key, it.item, it.version, it.root],
+            |r| r.get(0),
+        )?;
+        if restated > 0 || known {
+            return Ok(());
+        }
         tx.execute(
             "INSERT OR IGNORE INTO items (event_id, ts, author_key, author_call, item, kind, ext,
-                 title, version, size, root, source, sha256, hash_from, tiers, grp)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                 title, version, size, root, source, sha256, hash_from, tiers, grp, license,
+                 license_url, attribution, credit_seq)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+                 ?18, ?19, ?20)",
             params![
                 e.id,
                 ts,
@@ -270,6 +342,10 @@ impl Projection for Items {
                 it.hash_from,
                 serde_json::to_string(&it.tiers)?,
                 it.group,
+                it.credit.recorded.then_some(&it.credit.license),
+                it.credit.license_url,
+                it.credit.attribution,
+                e.seq as i64,
             ],
         )?;
         Ok(())
@@ -277,7 +353,7 @@ impl Projection for Items {
 }
 
 const ITEM_COLS: &str = "event_id, ts, author_call, item, kind, ext, title, version, size, root, \
-                         source, sha256, hash_from, tiers, grp";
+                         source, sha256, hash_from, tiers, grp, license, license_url, attribution";
 
 fn item_row(r: &rusqlite::Row) -> rusqlite::Result<Item> {
     let kind: String = r.get(4)?;
@@ -298,6 +374,15 @@ fn item_row(r: &rusqlite::Row) -> rusqlite::Result<Item> {
         hash_from: r.get(12)?,
         tiers: serde_json::from_str(&tiers).unwrap_or_default(),
         group: r.get(14)?,
+        credit: {
+            let license: Option<String> = r.get(15)?;
+            Credit {
+                recorded: license.is_some(),
+                license: license.unwrap_or_default(),
+                license_url: r.get(16)?,
+                attribution: r.get(17)?,
+            }
+        },
     })
 }
 
@@ -317,9 +402,22 @@ pub fn latest(conn: &Connection) -> Result<Vec<Item>> {
 /// same file published twice), so both are needed.
 pub fn published(conn: &Connection, item: &str, root: &str) -> Result<Option<Item>> {
     let mut st = conn.prepare(&format!(
-        "SELECT {ITEM_COLS} FROM items WHERE item = ?1 AND root = ?2 ORDER BY ts DESC LIMIT 1"
+        "SELECT {ITEM_COLS} FROM items WHERE item = ?1 AND root = ?2
+         ORDER BY (license <> '') DESC, ts DESC LIMIT 1"
     ))?;
     Ok(st.query_map([item, root], item_row)?.next().transpose()?)
+}
+
+/// The event in which one station published this version of an item.
+pub fn published_by(conn: &Connection, key: &str, item: &str, root: &str) -> Result<Option<Item>> {
+    let mut st = conn.prepare(&format!(
+        "SELECT {ITEM_COLS} FROM items WHERE author_key = ?1 AND item = ?2 AND root = ?3
+         ORDER BY ts DESC LIMIT 1"
+    ))?;
+    Ok(st
+        .query_map([key, item, root], item_row)?
+        .next()
+        .transpose()?)
 }
 
 /// How many different trusted stations published this exact file (same blob, same SHA-256)
@@ -675,6 +773,34 @@ mod tests {
                 .unwrap()
                 .version,
             "2026-09"
+        );
+    }
+
+    #[test]
+    fn a_credit_from_another_station_is_kept_short_and_links_only_to_the_web() {
+        let mut p = item("2026-08", &"a".repeat(64));
+        p["license"] = json!(" CC BY-SA 4.0 ");
+        p["attribution"] = json!("x".repeat(1000));
+        p["license_url"] = json!("javascript:alert(1)");
+        let c = parse_item(&p).unwrap().credit;
+        assert_eq!(c.license, "CC BY-SA 4.0");
+        assert_eq!(c.attribution.len(), 300);
+        assert_eq!(c.license_url, None);
+        assert!(c.recorded);
+        p["license"] = json!("L".repeat(81));
+        assert_eq!(parse_item(&p).unwrap().credit.license.len(), 80);
+        p["license_url"] = json!("https://creativecommons.org/licenses/by-sa/4.0/");
+        assert!(parse_item(&p).unwrap().credit.license_url.is_some());
+        let at = |n: usize| format!("https://x.org/{}", "a".repeat(n - "https://x.org/".len()));
+        assert!(web_url(&at(300)));
+        assert!(!web_url(&at(301)), "300 bytes at most");
+        p.as_object_mut()
+            .unwrap()
+            .retain(|k, _| !k.starts_with("li") && k != "attribution");
+        assert_eq!(
+            parse_item(&p).unwrap().credit,
+            Credit::default(),
+            "older fetchers sent none"
         );
     }
 

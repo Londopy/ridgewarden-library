@@ -38,6 +38,9 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/docs", get(docs_page))
         .route("/alerts", get(alerts_page))
         .route("/about", get(about_page))
+        .route("/about/third-party", get(crate::viewer::third_party))
+        .route("/viewer", get(crate::viewer::page))
+        .route("/viewer/{version}/{*path}", get(crate::viewer::asset))
         .route("/files/{name}", get(file))
         .route("/api/catalog", get(catalog_json))
         .route("/api/alerts", get(alerts_json))
@@ -45,7 +48,7 @@ pub fn router(app: Arc<App>) -> Router {
         .with_state(app)
 }
 
-struct Fail(anyhow::Error);
+pub(crate) struct Fail(anyhow::Error);
 
 impl IntoResponse for Fail {
     fn into_response(self) -> Response {
@@ -69,7 +72,13 @@ const NAV: &[(&str, &str)] = &[
     ("/about", "About"),
 ];
 
-async fn page(app: &App, active: &str, title: &str, body: &str, refresh: bool) -> Html<String> {
+pub(crate) async fn page(
+    app: &App,
+    active: &str,
+    title: &str,
+    body: &str,
+    refresh: bool,
+) -> Html<String> {
     let who = match app.whoami().await {
         Ok(w) if !w.node.is_empty() => format!("{} at {}", w.call, app.cfg.label(&w.node)),
         Ok(w) => w.call,
@@ -378,7 +387,7 @@ async fn catalog_page(State(app): State<Arc<App>>) -> Result<Html<String>, Fail>
         let _ = write!(
             b,
             "<h3>{} <span class=\"mute small\">{}</span></h3><p>Newest version <b>{}</b>, {}, \
-             fetched by {} {}.<br><span class=\"mute small\">From {}. {}{}</span></p>",
+             fetched by {} {}.<br><span class=\"mute small\">From {}. {}{}<br>{}</span></p>",
             esc(&it.title),
             esc(it.kind.word()),
             esc(&it.version),
@@ -387,7 +396,8 @@ async fn catalog_page(State(app): State<Arc<App>>) -> Result<Html<String>, Fail>
             esc(&ago(it.ts, now)),
             esc(&it.source),
             esc(&checked_text(it, confirmed)),
-            esc(&limits)
+            esc(&limits),
+            credit_html(Some(it))
         );
         b.push_str(
             "<div class=wrap><table><tr><th>Site</th><th>Holds</th><th></th><th>As of</th></tr>",
@@ -476,6 +486,21 @@ fn fetched_of(h: &Held, it: &Option<Item>) -> i64 {
     it.as_ref().map_or(h.event_ts, |i| i.ts)
 }
 
+/// An item's license and who to credit, as its fetcher stated them.
+pub(crate) fn credit_html(it: Option<&Item>) -> String {
+    let c = it.map(|i| i.credit.clone()).unwrap_or_default();
+    let license = match (c.license.trim_end_matches('.'), &c.license_url) {
+        _ if !c.recorded => "License not recorded (published before 0.2.0)".to_string(),
+        ("", _) => "License not stated by the station that published it".to_string(),
+        (l, Some(u)) => format!("License: <a href=\"{}\">{}</a>", esc(u), esc(l)),
+        (l, None) => format!("License: {}", esc(l)),
+    };
+    match c.attribution.trim_end_matches('.') {
+        "" => format!("{license}."),
+        a => format!("{license}. Credit: {}.", esc(a)),
+    }
+}
+
 async fn wiki_page(State(app): State<Arc<App>>) -> Result<Html<String>, Fail> {
     let now = now_ms();
     let zims = held_of(&app, Kind::Zim)?;
@@ -540,17 +565,16 @@ async fn wiki_page(State(app): State<Arc<App>>) -> Result<Html<String>, Fail> {
         b.push_str(&stale_banner(&app, &title, fetched, now));
         let _ = write!(
             b,
-            "<h2>{}</h2><p>Version {}, {}. Fetched from the internet {}; articles are as of then.</p>",
+            "<h2>{}</h2><p>Version {}, {}. Fetched from the internet {}; articles are as of then.</p>\
+             <p class=small>{}</p>",
             esc(&title),
             esc(&h.version),
             size_text(h.size),
-            esc(&ago(fetched, now))
+            esc(&ago(fetched, now)),
+            credit_html(it.as_ref())
         );
     }
-    b.push_str(
-        "<p class=\"mute small\">Wikipedia text is available under the Creative Commons \
-         Attribution-ShareAlike License. See <a href=\"/about\">About</a>.</p>",
-    );
+    b.push_str(CREDITS_NOTE);
     Ok(page(&app, "/wiki", "Wikipedia", &b, false).await)
 }
 
@@ -585,13 +609,16 @@ async fn maps_page(State(app): State<Arc<App>>, headers: HeaderMap) -> Result<Ht
         let name = h.path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         let _ = write!(
             b,
-            "<h2>{}</h2><p>Map data from {}, {}. Fetched {}.</p>\
+            "<h2>{}</h2><p>Map data from {}, {}. Fetched {}.</p><p class=small>{}</p>\
+             <p><a href=\"/viewer?map={}\"><b>Open in the map viewer</b></a></p>\
              <p><code>http://{}/files/{}</code><br><span class=\"mute small\">always the newest \
              version; this one is also at <code>/files/{}</code></span></p>",
             esc(&title),
             esc(&h.version),
             size_text(h.size),
             esc(&ago(fetched, now)),
+            credit_html(it.as_ref()),
+            esc(&h.item),
             esc(&host),
             esc(&stable_name(h)),
             esc(name)
@@ -606,10 +633,7 @@ async fn maps_page(State(app): State<Arc<App>>, headers: HeaderMap) -> Result<Ht
              are refused here to keep the radio links free for traffic.</p>",
         );
     }
-    b.push_str(
-        "<p class=\"mute small\">Map data &copy; OpenStreetMap contributors, available under the \
-         Open Database License. See <a href=\"/about\">About</a>.</p>",
-    );
+    b.push_str(CREDITS_NOTE);
     Ok(page(&app, "/maps", "Maps", &b, false).await)
 }
 
@@ -643,9 +667,11 @@ async fn docs_page(State(app): State<Arc<App>>) -> Result<Html<String>, Fail> {
         };
         let _ = write!(
             b,
-            "<tr><td><a href=\"/files/{}\">{}</a>{big}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            "<tr><td><a href=\"/files/{}\">{}</a>{big}<br><span class=\"mute small\">{}</span></td>\
+             <td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
             esc(&stable_name(h)),
             esc(&title),
+            credit_html(it.as_ref()),
             esc(&h.ext.to_ascii_uppercase()),
             size_text(h.size),
             esc(&h.version),
@@ -654,6 +680,7 @@ async fn docs_page(State(app): State<Arc<App>>) -> Result<Html<String>, Fail> {
     }
     if !docs.is_empty() {
         b.push_str("</table></div>");
+        b.push_str(CREDITS_NOTE);
     }
     b.push_str(&banners);
     Ok(page(&app, "/docs", "Documents", &b, false).await)
@@ -747,36 +774,72 @@ async fn alerts_page(State(app): State<Arc<App>>) -> Result<Html<String>, Fail> 
         }
         _ => b.push_str("<p class=mute>No alerts have arrived here in the last 7 days.</p>"),
     }
-    b.push_str(
-        "<p class=\"mute small\">Every site's figure is on the <a href=\"/\">catalog</a>.</p>",
+    let _ = write!(
+        b,
+        "<p class=\"mute small\">Alerts move between sites with the ridgewarden cores' sync \
+         rounds, one round or more per hop, so the cores' <code>[sync] interval_s</code> sets this \
+         figure. Before it starts, the fetching site checks the NWS every {} seconds; if that site \
+         goes quiet, another takes over after {} minutes, and alerts issued in between arrive that \
+         much later. Every site's figure is on the <a href=\"/\">catalog</a>.</p>",
+        app.cfg.nws.poll_s,
+        (app.cfg.nws.quiet_s + 30) / 60
     );
     Ok(page(&app, "/alerts", "Alerts", &b, true).await)
 }
 
-async fn about_page(State(app): State<Arc<App>>) -> Html<String> {
-    let b = "<h1>About this library</h1>\
+/// Points from a content page to the full list of credits.
+const CREDITS_NOTE: &str = "<p class=\"mute small\">The license and credits of everything this \
+     library carries are also on the <a href=\"/about\">About</a> page.</p>";
+
+async fn about_page(State(app): State<Arc<App>>) -> Result<Html<String>, Fail> {
+    let items = catalog::latest(&app.db())?;
+    let mut b = String::from(
+        "<h1>About this library</h1>\
 <p>A disaster fallback for the mesh: reference, maps, documents and weather alerts fetched by a \
 site that has internet and copied to the others, so they stay usable when the internet is down. \
 It is not a replacement for internet access, and carries no general browsing.</p>\
-<h2>Wikipedia</h2><p>Articles come from <a href=\"https://www.wikipedia.org/\">Wikipedia</a>, \
-written by its volunteer contributors, packaged for offline use by \
-<a href=\"https://kiwix.org/\">Kiwix</a>. The text is available under the \
-<a href=\"https://creativecommons.org/licenses/by-sa/4.0/\">Creative Commons Attribution-ShareAlike \
-4.0 License</a>; images carry their own licenses, shown on each file's page. The copy here may \
-be weeks or months old: each article is as of the date shown on the Wikipedia page of this app.</p>\
-<h2>Maps</h2><p>Map data &copy; <a href=\"https://www.openstreetmap.org/copyright\">OpenStreetMap \
-contributors</a>, available under the <a href=\"https://opendatacommons.org/licenses/odbl/\">Open \
-Database License</a>. Tiles built by <a href=\"https://protomaps.com/\">Protomaps</a>. Anyone \
-showing these maps must credit OpenStreetMap.</p>\
-<h2>Documents</h2><p>Forms, plans and phone lists come from whoever published them, named on \
-the catalog page. They are readable by anyone on the mesh.</p>\
+<h2>Licenses and credits</h2>",
+    );
+    if items.is_empty() {
+        b.push_str("<p class=mute>Nothing has been published yet.</p>");
+    } else {
+        b.push_str(
+            "<p>Each item is redistributed under its own license, as the station that fetched it \
+             states it. Anyone reusing it must credit its authors as below.</p>\
+             <div class=wrap><table><tr><th>Item</th><th>License and credit</th><th>From</th></tr>",
+        );
+        for it in &items {
+            let _ = write!(
+                b,
+                "<tr><td>{} <span class=\"mute small\">{}</span></td><td class=small>{}</td>\
+                 <td class=small>{}</td></tr>",
+                esc(&it.title),
+                esc(it.kind.word()),
+                credit_html(Some(it)),
+                esc(&it.source)
+            );
+        }
+        b.push_str("</table></div>");
+    }
+    b.push_str(
+        "<p class=small>The map viewer is built from MapLibre GL JS, pmtiles, the Protomaps basemap \
+style, Noto Sans fonts and Mapzen-derived icons; their sources and licenses are on the \
+<a href=\"/about/third-party\">third-party page</a>. Maps it draws are OpenStreetMap data and \
+credit OpenStreetMap on the map.</p>\
 <h2>Weather alerts</h2><p>Alerts come from the <a href=\"https://www.weather.gov/\">National Weather \
 Service</a> (api.weather.gov) and are passed on unchanged. They may be minutes old; the alerts \
 page says when they were last fetched. In an emergency, follow official instructions.</p>\
 <h2>Amateur radio rules</h2><p>Everything here crosses the mesh as plain HTTP, signed but never \
-encrypted. No music or video is carried. Large files move at a capped rate so they never crowd out \
-other traffic, and alerts always go first.</p>";
-    page(&app, "/about", "About", b, false).await
+encrypted. The operators publish no music or video. Large files move at a capped rate so they \
+never crowd out other traffic, and alerts always go first.</p><p>Every site keeps its own copy, so \
+people read the library at their own site, over its local network. Over the radio links, the \
+stations' cores copy content and alerts to each other. Someone without an amateur license \
+reading another site's library across the mesh is generally treated as third-party \
+communication (47 CFR 97.115(b) and (c)), like any mesh service used by people without a \
+license: it is up to the control operators of the stations involved. A site that wants its \
+library kept to its own network can have its operator firewall it to the local subnet.</p>",
+    );
+    Ok(page(&app, "/about", "About", &b, false).await)
 }
 
 /// A byte range of a file of `len` bytes, from a Range header.
@@ -948,7 +1011,8 @@ async fn catalog_json(State(app): State<Arc<App>>) -> Result<Json<Value>, Fail> 
                    "version": i.version, "size": i.size, "root": i.root, "published_by": i.call,
                    "published_ms": i.ts, "source": i.source, "sha256": i.sha256,
                    "hash_from": i.hash_from, "confirmations": confirmed, "tiers": i.tiers,
-                   "group": i.group}),
+                   "group": i.group, "license": i.credit.license,
+                   "license_url": i.credit.license_url, "attribution": i.credit.attribution}),
         );
     }
     let holds = catalog::holds(&db)?;

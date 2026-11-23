@@ -617,6 +617,7 @@ mod tests {
         std::fs::write(&f, "name,phone\nShelter desk,555-0100\n").unwrap();
         let extra = format!(
             "[[item]]\nid = 'phones'\nkind = 'doc'\ntitle = 'Shelter phones'\nfile = '{}'\nmax_mb = 1\n\
+             license = 'For agency use'\nattribution = 'County office'\n\
              [mule]\nisland = 'north'\nto = ['south']\n",
             f.to_string_lossy().replace('\\', "/")
         );
@@ -640,6 +641,8 @@ mod tests {
         let kinds: Vec<&str> = c.appended.iter().map(|(k, _)| k.as_str()).collect();
         assert_eq!(kinds, ["library.item", "mule.msg"]);
         assert_eq!(c.appended[0].1["ext"], "csv");
+        assert_eq!(c.appended[0].1["license"], "For agency use");
+        assert_eq!(c.appended[0].1["attribution"], "County office");
         assert_eq!(c.appended[1].1["to"], "south");
         let h = mirror::held_one(&app.db(), "phones").unwrap().unwrap();
         assert_eq!(h.kind, Kind::Doc);
@@ -739,5 +742,350 @@ mod tests {
             let r = http.get(format!("{base}{page}")).send().await.unwrap();
             assert_eq!(r.status(), 200, "{page}");
         }
+    }
+
+    async fn serve(app: Arc<App>) -> (String, reqwest::Client) {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", l.local_addr().unwrap());
+        let router = crate::web::router(app);
+        tokio::spawn(async move { axum::serve(l, router).await.unwrap() });
+        (base, reqwest::Client::builder().no_proxy().build().unwrap())
+    }
+
+    async fn text(http: &reqwest::Client, url: String) -> String {
+        http.get(url).send().await.unwrap().text().await.unwrap()
+    }
+
+    /// Put `data` in place as the version this site serves of `item`.
+    async fn serve_file(app: &App, item: &str, kind: Kind, ext: &str, data: &[u8]) -> Held {
+        let path = app
+            .cfg
+            .content_dir()
+            .join(format!("{item}_2026-11-18.{ext}"));
+        std::fs::write(&path, data).unwrap();
+        let h = Held {
+            item: item.into(),
+            kind,
+            ext: ext.into(),
+            version: "2026-11-18".into(),
+            root: root_of(data),
+            path,
+            size: data.len() as u64,
+            sha256: crate::sha256::hex_of(data),
+            verified: "fetcher".into(),
+            event_ts: 1000,
+            since_ms: 1000,
+            checked_ms: now_ms(),
+        };
+        mirror::install(app, &h, false).await.unwrap();
+        h
+    }
+
+    /// Apply a `library.item` from this site's own core, as its `seq`th event.
+    fn mine(app: &App, payload: Value, seq: u64, ts: i64) {
+        let mut e = Fake::new(vec![]).add("library.item", payload, ts);
+        e.author.key = "ab".repeat(32);
+        e.seq = seq;
+        e.id = format!("mine{seq}");
+        let mut db = app.db();
+        let tx = db.transaction().unwrap();
+        Items.apply(&tx, &e, ts).unwrap();
+        tx.commit().unwrap();
+    }
+
+    #[tokio::test]
+    async fn every_page_credits_each_item_as_its_fetcher_states() {
+        let d = tempfile::tempdir().unwrap();
+        let (app, _core) = app(d.path(), "").await;
+        let wiki = serve_old(&app).await;
+        let mut tiles = b"PMTiles\x03".to_vec();
+        tiles.extend([1u8; 100]);
+        let map = serve_file(&app, "map", Kind::Pmtiles, "pmtiles", &tiles).await;
+        let doc = serve_file(&app, "phones", Kind::Doc, "csv", b"name,phone\n").await;
+        for (seq, p) in [
+            json!({"item": "wiki", "kind": "zim", "title": "Wikipedia", "version": "2026-08",
+                   "size": wiki.size, "root": wiki.root, "source": "test",
+                   "license": "CC BY-SA 4.0",
+                   "license_url": "https://example.org/by-sa?a=\"b\"",
+                   "attribution": "Wikipedia <b>contributors</b>."}),
+            json!({"item": "map", "kind": "pmtiles", "title": "Region", "version": "2026-11-18",
+                   "size": map.size, "root": map.root, "source": "test", "license": "ODbL.",
+                   "license_url": "javascript:alert(1)", "attribution": "OSM \"contributors\""}),
+            json!({"item": "phones", "kind": "doc", "ext": "csv", "title": "Phones",
+                   "version": "2026-11-18", "size": doc.size, "root": doc.root, "source": "test",
+                   "license": ""}),
+            json!({"item": "old", "kind": "doc", "ext": "csv", "title": "Old list",
+                   "version": "2026-11-18", "size": 1, "root": "e".repeat(64), "source": "test"}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            mine(&app, p, seq as u64 + 1, 1000);
+        }
+        let (base, http) = serve(app.clone()).await;
+        let wiki_credit = "License: <a href=\"https://example.org/by-sa?a=&quot;b&quot;\">CC \
+                           BY-SA 4.0</a>. Credit: Wikipedia &lt;b&gt;contributors&lt;/b&gt;.";
+        let map_credit = "License: ODbL. Credit: OSM &quot;contributors&quot;.";
+        let doc_credit = "License not stated by the station that published it.";
+        let pages = [
+            ("/wiki", vec![wiki_credit]),
+            ("/maps", vec![map_credit]),
+            (
+                "/viewer?map=map",
+                vec![map_credit, "Region version 2026-11-18."],
+            ),
+            ("/docs", vec![doc_credit]),
+            ("/", vec![wiki_credit, map_credit, doc_credit]),
+            (
+                "/about",
+                vec![
+                    wiki_credit,
+                    map_credit,
+                    doc_credit,
+                    "License not recorded (published before 0.2.0).",
+                    "97.115",
+                ],
+            ),
+        ];
+        for (path, want) in pages {
+            let body = text(&http, format!("{base}{path}")).await;
+            for w in want {
+                assert!(body.contains(w), "{path} lacks {w}:\n{body}");
+            }
+            assert!(!body.contains("javascript:"), "{path}");
+        }
+        let api: Value =
+            serde_json::from_str(&text(&http, format!("{base}/api/catalog")).await).unwrap();
+        let map = api["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["item"] == "map")
+            .unwrap();
+        assert_eq!(map["license"], "ODbL.");
+        assert!(map["license_url"].is_null());
+    }
+
+    #[tokio::test]
+    async fn a_changed_license_is_restated_for_the_version_already_published() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("phones.csv");
+        std::fs::write(&f, "name,phone\n").unwrap();
+        let extra = format!(
+            "[[item]]\nid = 'phones'\nkind = 'doc'\ntitle = 'Shelter phones'\nfile = '{}'\n\
+             max_mb = 1\nlicense = 'CC BY 4.0'\nattribution = 'County office'\n\
+             [mule]\nisland = 'north'\nto = ['south']\n",
+            f.to_string_lossy().replace('\\', "/")
+        );
+        let (app, core) = app(d.path(), &extra).await;
+        // published by 0.1.0, whose events carried no license
+        let h = serve_file(&app, "phones", Kind::Doc, "csv", b"name,phone\n").await;
+        let old = json!({"item": "phones", "kind": "doc", "ext": "csv",
+                         "title": "Shelter phones", "version": "2026-11-18", "size": h.size,
+                         "root": h.root, "source": "a file supplied by the site's operator"});
+        mine(&app, old, 1, 1000);
+        crate::fetch::round(&app).await.unwrap();
+        let sent = core.lock().unwrap().appended.clone();
+        assert_eq!(sent.len(), 1, "one restatement, no mule message: {sent:?}");
+        let (kind, p) = &sent[0];
+        assert_eq!(kind, "library.item");
+        assert_eq!(p["root"], h.root.as_str());
+        assert_eq!(p["version"], "2026-11-18");
+        assert_eq!(p["license"], "CC BY 4.0");
+        assert_eq!(p["attribution"], "County office");
+        mine(&app, p.clone(), 2, 5000);
+        let l = crate::catalog::latest(&app.db()).unwrap();
+        assert_eq!(l.len(), 1);
+        assert_eq!(l[0].credit.license, "CC BY 4.0");
+        assert_eq!(l[0].ts, 1000, "still fetched when it was");
+        crate::fetch::round(&app).await.unwrap();
+        assert_eq!(core.lock().unwrap().appended.len(), 1, "said once");
+        // an older restatement arriving late doesn't undo a newer one
+        let mut stale = p.clone();
+        stale["license"] = json!("something older");
+        mine(&app, stale, 1, 900);
+        assert_eq!(
+            crate::catalog::latest(&app.db()).unwrap()[0].credit.license,
+            "CC BY 4.0"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_database_from_0_1_0_opens_and_its_versions_have_no_recorded_license() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("lib")).unwrap();
+        {
+            let c = rusqlite::Connection::open(d.path().join("lib/library.db")).unwrap();
+            c.execute_batch(
+                "CREATE TABLE items (event_id TEXT PRIMARY KEY, ts INTEGER NOT NULL,
+                     author_key TEXT NOT NULL, author_call TEXT NOT NULL, item TEXT NOT NULL,
+                     kind TEXT NOT NULL, ext TEXT NOT NULL, title TEXT NOT NULL,
+                     version TEXT NOT NULL, size INTEGER NOT NULL, root TEXT NOT NULL,
+                     source TEXT NOT NULL, sha256 TEXT, hash_from TEXT, tiers TEXT NOT NULL,
+                     grp TEXT NOT NULL);
+                 INSERT INTO items VALUES ('e1', 1000, 'k', 'N0OLD', 'wiki', 'zim', 'zim',
+                     'Wikipedia', '2026-08', 10, 'aaaa', 'test', NULL, NULL, '[]', '');
+                 CREATE TABLE sources (item TEXT PRIMARY KEY, ident TEXT,
+                     checked_ms INTEGER NOT NULL DEFAULT 0, error TEXT, outbox TEXT,
+                     candidate TEXT, fails INTEGER NOT NULL DEFAULT 0);
+                 INSERT INTO sources (item, ident) VALUES ('wiki', 'x');",
+            )
+            .unwrap();
+        }
+        let (app, _core) = app(d.path(), "").await;
+        let l = crate::catalog::latest(&app.db()).unwrap();
+        assert_eq!(l[0].credit, crate::catalog::Credit::default());
+        let (base, http) = serve(app.clone()).await;
+        let about = text(&http, format!("{base}/about")).await;
+        assert!(about.contains("License not recorded (published before 0.2.0)."));
+    }
+
+    #[tokio::test]
+    async fn the_map_viewer_and_everything_it_loads_come_from_here() {
+        use crate::viewer::{ASSETS, PREFIX};
+        let prefix = PREFIX.as_str();
+        let d = tempfile::tempdir().unwrap();
+        let (app, _core) = app(d.path(), "").await;
+        let (base, http) = serve(app.clone()).await;
+        // no map yet: the page says so and loads no script
+        let body = http
+            .get(format!("{base}/viewer"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            body.contains("No map files") && !body.contains("<script"),
+            "{body}"
+        );
+        let path = app
+            .cfg
+            .content_dir()
+            .join("region_2026-11-18_abcdabcd.pmtiles");
+        std::fs::write(&path, b"PMTiles\x03rest").unwrap();
+        let h = Held {
+            item: "region".into(),
+            kind: Kind::Pmtiles,
+            ext: "pmtiles".into(),
+            version: "2026-11-18".into(),
+            root: "abcdabcd".repeat(8),
+            path,
+            size: 12,
+            sha256: String::new(),
+            verified: "fetcher".into(),
+            event_ts: 1,
+            since_ms: 1,
+            checked_ms: now_ms(),
+        };
+        mirror::install(&app, &h, false).await.unwrap();
+        let body = http
+            .get(format!("{base}/viewer"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            body.contains("data-file=\"/files/region.pmtiles\""),
+            "{body}"
+        );
+        assert!(body.contains(&format!("data-assets=\"{prefix}\"")));
+        assert!(body.contains("OpenStreetMap contributors") && body.contains("Protomaps"));
+        assert!(
+            body.contains("<noscript>"),
+            "a page without JavaScript still says where the map is"
+        );
+        assert!(
+            !body
+                .replace("pmtiles://", "")
+                .replace("glyphs://", "")
+                .contains("://")
+                && !body.contains("\"//"),
+            "nothing is fetched from elsewhere"
+        );
+        for wired in [
+            format!("href=\"{prefix}/maplibre-gl.css\""),
+            format!("src=\"{prefix}/pmtiles.js\""),
+            format!("src=\"{prefix}/basemaps.js\""),
+            "<script type=module>".to_string(),
+        ] {
+            assert!(body.contains(&wired), "{wired}");
+        }
+        let r = http
+            .get(format!("{base}/viewer?map=nope"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 404);
+        let maps = http
+            .get(format!("{base}/maps"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(maps.contains("/viewer?map=region"));
+        for a in ASSETS {
+            let url = format!("{base}{prefix}/{}", a.path.replace(' ', "%20"));
+            let r = http.get(&url).send().await.unwrap();
+            assert_eq!(r.status(), 200, "{url}");
+            assert_eq!(r.headers()["content-type"], a.ctype, "{url}");
+            assert!(
+                r.headers()["cache-control"]
+                    .to_str()
+                    .unwrap()
+                    .contains("immutable")
+            );
+            assert_eq!(r.headers()["x-content-type-options"], "nosniff");
+            let got = r.bytes().await.unwrap();
+            assert_eq!(
+                crate::sha256::hex_of(&got),
+                crate::sha256::hex_of(a.body),
+                "{url}"
+            );
+        }
+        // MapLibre asks for its worker with a version query, and for whole font stacks
+        let r = http
+            .get(format!("{base}{prefix}/maplibre-gl-worker.mjs?v=6.19.0"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        let r = http
+            .get(format!(
+                "{base}{prefix}/fonts/Noto%20Sans%20Regular,Noto%20Sans%20Devanagari%20Regular%20v1/0-255.pbf"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        for missing in [
+            format!("{prefix}/fonts/Noto%20Sans%20Regular/2304-2559.pbf"),
+            "/viewer/000000000000/maplibre-gl.mjs".to_string(),
+            format!("{prefix}/..%2F..%2FCargo.toml"),
+        ] {
+            let r = http.get(format!("{base}{missing}")).send().await.unwrap();
+            assert_eq!(r.status(), 404, "{missing}");
+        }
+        // a glyph range not held is not asked for again on every visit
+        let r = http
+            .get(format!(
+                "{base}{prefix}/fonts/Noto%20Sans%20Regular/2304-2559.pbf"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.headers()["cache-control"], "public, max-age=86400");
+        let r = http
+            .get(format!("{base}/about/third-party"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.headers()["content-type"], "text/plain; charset=utf-8");
+        assert!(r.text().await.unwrap().contains("BSD-3-Clause"));
     }
 }

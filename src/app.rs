@@ -71,7 +71,9 @@ CREATE TABLE IF NOT EXISTS sources (
     -- an operator's file seen last round, published once it stops changing
     candidate  TEXT,
     -- failed tries in a row, for the backoff
-    fails      INTEGER NOT NULL DEFAULT 0
+    fails      INTEGER NOT NULL DEFAULT 0,
+    -- the license and credit last published (JSON)
+    credit     TEXT
 );
 "#;
 
@@ -134,7 +136,12 @@ impl App {
             &db,
             &[
                 ("pending", "sources", "TEXT"),
+                ("sources", "credit", "TEXT"),
                 ("sites", "core_url", "TEXT"),
+                ("items", "license", "TEXT"),
+                ("items", "license_url", "TEXT"),
+                ("items", "attribution", "TEXT NOT NULL DEFAULT ''"),
+                ("items", "credit_seq", "INTEGER NOT NULL DEFAULT 0"),
             ],
         )?;
         std::fs::create_dir_all(cfg.content_dir())

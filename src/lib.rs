@@ -21,6 +21,7 @@ pub mod nws;
 pub mod sha256;
 #[cfg(test)]
 mod testing;
+pub mod viewer;
 pub mod web;
 
 use std::sync::Arc;

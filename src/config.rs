@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::catalog::{Credit, web_url};
 use crate::content::{Kind, valid_item};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -97,6 +98,14 @@ pub struct ItemCfg {
     /// the biggest one its tier and limits allow
     #[serde(default)]
     pub group: String,
+    /// the license the content is under, e.g. "CC BY-SA 4.0", shown with it at every site
+    #[serde(default)]
+    pub license: String,
+    #[serde(default)]
+    pub license_url: Option<String>,
+    /// who to credit, e.g. "Wikipedia contributors, packaged by Kiwix"
+    #[serde(default)]
+    pub attribution: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -411,6 +420,17 @@ impl ItemCfg {
                 self.group
             );
         }
+        if self.license.chars().count() > 80 || self.attribution.chars().count() > 300 {
+            bail!(
+                "item {}: keep license under 80 characters and attribution under 300",
+                self.id
+            );
+        }
+        if let Some(u) = &self.license_url
+            && !web_url(u)
+        {
+            bail!("item {}: license_url must be an http(s) address", self.id);
+        }
         if self.kind == Kind::Doc {
             let name = match (&self.url, &self.file) {
                 (Some(u), _) => u.rsplit('/').next().unwrap_or(""),
@@ -426,6 +446,50 @@ impl ItemCfg {
 
     pub fn max_bytes(&self) -> u64 {
         self.max_mb * 1_000_000
+    }
+
+    /// The license and credit published with each version. When the operator gives none,
+    /// the two sources whose terms are certain fill them in: Wikipedia files from Kiwix and
+    /// maps cut from a Protomaps daily build, which is OpenStreetMap data.
+    pub fn credit(&self) -> Credit {
+        let stated = |license: &str, url: Option<&str>, attribution: &str| Credit {
+            license: license.trim().into(),
+            license_url: url.map(str::to_string),
+            attribution: attribution.trim().into(),
+            recorded: true,
+        };
+        if !self.license.is_empty() || !self.attribution.is_empty() || self.license_url.is_some() {
+            return stated(
+                &self.license,
+                self.license_url.as_deref(),
+                &self.attribution,
+            );
+        }
+        let kiwix_wikipedia = self.kind == Kind::Zim
+            && self.url.as_deref().is_some_and(|u| {
+                u.starts_with("https://download.kiwix.org/zim/")
+                    && u.rsplit('/')
+                        .next()
+                        .is_some_and(|n| n.starts_with("wikipedia_"))
+            });
+        let protomaps =
+            self.kind == Kind::Pmtiles && self.command.iter().any(|a| a.contains("{build}"));
+        if kiwix_wikipedia {
+            stated(
+                "CC BY-SA 4.0",
+                Some("https://creativecommons.org/licenses/by-sa/4.0/"),
+                "Wikipedia contributors, packaged by Kiwix; images carry their own licenses",
+            )
+        } else if protomaps {
+            // OpenStreetMap asks for a link to its copyright page, which explains the ODbL
+            stated(
+                "ODbL 1.0",
+                Some("https://www.openstreetmap.org/copyright"),
+                "\u{a9} OpenStreetMap contributors; tiles built by Protomaps",
+            )
+        } else {
+            stated("", None, "")
+        }
     }
 }
 
@@ -578,6 +642,10 @@ confirmations = 1
 # Only a site with internet (a fetcher) lists items. Nothing is downloaded unless it is
 # listed here, and nothing bigger than its max_mb. Start small: these are test-sized.
 #
+# license, license_url and attribution are shown with the item at every site. Wikipedia
+# files from download.kiwix.org and maps cut from a Protomaps build get theirs filled in
+# (CC BY-SA 4.0, and ODbL for OpenStreetMap data); give them for anything else.
+#
 # [[item]]
 # id = "wikipedia-en-test"
 # kind = "zim"
@@ -621,6 +689,9 @@ confirmations = 1
 # title = "Regional map"
 # file = "/var/lib/ridgewarden-library/region.pmtiles"
 # max_mb = 2000
+# license = "ODbL 1.0"
+# license_url = "https://www.openstreetmap.org/copyright"
+# attribution = "OpenStreetMap contributors"
 #
 # # forms, plans and phone lists served agencies ask for (pdf, txt, csv, md, odt, ods,
 # # docx, xlsx, png, jpg); anyone on the mesh can read them
@@ -630,6 +701,8 @@ confirmations = 1
 # title = "Shelter phone list"
 # file = "/var/lib/ridgewarden-library/docs/shelter-phones.csv"
 # max_mb = 5
+# license = "For the served agencies' use"
+# attribution = "County emergency services office"
 
 # NWS alerts. Turn on at every site with internet; one of them fetches at a time.
 [nws]
@@ -762,5 +835,81 @@ max_mb = 10
         c.validate().unwrap();
         c.mule.to = vec!["north".into()];
         assert!(c.validate().is_err(), "sending to yourself");
+    }
+
+    fn one_item(toml_item: &str) -> ItemCfg {
+        let c: Config = toml::from_str(&format!("[[item]]\nmax_mb = 1\n{toml_item}")).unwrap();
+        c.validate().unwrap();
+        c.items[0].clone()
+    }
+
+    #[test]
+    fn known_sources_get_their_license_and_others_say_what_they_are() {
+        let none = Credit {
+            recorded: true,
+            ..Credit::default()
+        };
+        let wiki = one_item(
+            "id = 'w'\nkind = 'zim'\ntitle = 'W'\n\
+             url = 'https://download.kiwix.org/zim/wikipedia_en_all_mini.zim'",
+        );
+        assert_eq!(wiki.credit().license, "CC BY-SA 4.0");
+        assert!(wiki.credit().attribution.contains("Wikipedia contributors"));
+        let map = one_item(
+            "id = 'm'\nkind = 'pmtiles'\ntitle = 'M'\n\
+             command = ['pmtiles', 'extract', '--source={build}', '{out}', '--bbox=1,2,3,4']",
+        );
+        assert_eq!(map.credit().license, "ODbL 1.0");
+        assert_eq!(
+            map.credit().license_url.as_deref(),
+            Some("https://www.openstreetmap.org/copyright")
+        );
+        assert!(map.credit().attribution.contains("OpenStreetMap"));
+        for (toml_item, why) in [
+            (
+                "id = 'g'\nkind = 'zim'\ntitle = 'G'\n\
+                 url = 'https://download.kiwix.org/zim/gutenberg_en_all.zim'",
+                "not Wikipedia",
+            ),
+            (
+                "id = 'g'\nkind = 'zim'\ntitle = 'G'\n\
+                 url = 'https://mirror.example.org/zim/wikipedia_en_all_mini.zim'",
+                "Wikipedia's name on another host",
+            ),
+            (
+                "id = 'g'\nkind = 'zim'\ntitle = 'G'\ncommand = ['make-zim', '{build}', '{out}']",
+                "a ZIM made from a Protomaps build",
+            ),
+            (
+                "id = 'g'\nkind = 'doc'\ntitle = 'G'\n\
+                 url = 'https://download.kiwix.org/zim/wikipedia_en_notes.pdf'",
+                "a document at a Kiwix Wikipedia address",
+            ),
+        ] {
+            assert_eq!(one_item(toml_item).credit(), none, "{why}");
+        }
+        let own = one_item(
+            "id = 'w'\nkind = 'zim'\ntitle = 'W'\n\
+             url = 'https://download.kiwix.org/zim/wikipedia_en_all_mini.zim'\n\
+             license = 'CC BY-SA 3.0'\nattribution = 'Wikipedia editors'",
+        );
+        assert_eq!(own.credit().license, "CC BY-SA 3.0");
+        assert_eq!(own.credit().attribution, "Wikipedia editors");
+        assert_eq!(
+            own.credit().license_url,
+            None,
+            "the operator's word wins whole"
+        );
+    }
+
+    #[test]
+    fn a_license_link_must_be_a_web_address() {
+        let bad = "[[item]]\nid = 'd'\nkind = 'doc'\ntitle = 'D'\nfile = '/x/d.pdf'\nmax_mb = 1\n\
+                   license = 'Mine'\nlicense_url = 'javascript:alert(1)'";
+        let c: Config = toml::from_str(bad).unwrap();
+        assert!(c.validate().is_err());
+        let c: Config =
+            toml::from_str(&bad.replace("javascript:alert(1)", "https://x.org/l")).unwrap();
+        c.validate().unwrap();
     }
 }

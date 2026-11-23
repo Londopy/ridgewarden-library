@@ -864,6 +864,7 @@ mod tests {
             hash_from: None,
             tiers: vec![],
             group: String::new(),
+            credit: Default::default(),
         }
     }
 
